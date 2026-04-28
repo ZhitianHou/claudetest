@@ -48,10 +48,8 @@ from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
-    slice_position_embedding,
     sp_pad_and_slice,
 )
-from ....distributed.sequence_parallel.ulysses import _Gather
 from ....ops.loss import causallm_loss_function
 from ....utils import helper
 from ....utils.device import is_torch_npu_available
@@ -773,10 +771,19 @@ class Qwen3_5Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape)             # (B, S/sp, num_kv_heads, D)
 
         # ── Ulysses SP all-to-all ──
-        if get_parallel_state().ulysses_enabled:
-            query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            key_states   = gather_seq_scatter_heads(key_states,   seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+        # Repeat KV heads to match Q heads BEFORE the all-to-all so that the head
+        # dimension is divisible by sp_size when num_kv_heads < sp_size. After this
+        # the kv heads count equals num_attention_heads, so the attention kernel does
+        # not need to repeat again (pass num_key_value_groups=1).
+        ulysses_enabled = get_parallel_state().ulysses_enabled
+        if ulysses_enabled:
+            ulysses_group = get_parallel_state().ulysses_group
+            if self.num_key_value_groups > 1:
+                key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=2)
+                value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=2)
+            query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2, group=ulysses_group)
+            key_states   = gather_seq_scatter_heads(key_states,   seq_dim=1, head_dim=2, group=ulysses_group)
+            value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2, group=ulysses_group)
 
         query_states = query_states.transpose(1, 2)
         key_states   = key_states.transpose(1, 2)
@@ -794,19 +801,27 @@ class Qwen3_5Attention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+        # KV was already replicated to match Q for the SP path; tell the attention
+        # kernel not to repeat again by temporarily setting num_key_value_groups=1.
+        original_groups = self.num_key_value_groups
+        if ulysses_enabled:
+            self.num_key_value_groups = 1
+        try:
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+        finally:
+            self.num_key_value_groups = original_groups
 
-        if get_parallel_state().ulysses_enabled:
-            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group)
+        if ulysses_enabled:
+            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, group=ulysses_group)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
@@ -1011,12 +1026,26 @@ class Qwen3_5VisionAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # When SP is enabled the incoming hidden_states / cos / sin are already
+        # sliced along the sequence dim (see Qwen3_5VisionModel.forward where
+        # sp_pad_and_slice is applied). We apply rotary on the local slice and
+        # then do an all-to-all to obtain the full padded sequence with sharded
+        # heads for the attention kernel.
         seq_length = hidden_states.shape[0]
         query_states, key_states, value_states = (
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+
+        # ── Ulysses SP all-to-all on Q/K/V ──
+        ulysses_enabled = get_parallel_state().ulysses_enabled
+        if ulysses_enabled:
+            ulysses_group = get_parallel_state().ulysses_group
+            # (S/sp, num_heads, head_dim) -> (S_full_padded, num_heads/sp, head_dim)
+            query_states = gather_seq_scatter_heads(query_states, seq_dim=0, head_dim=1, group=ulysses_group)
+            key_states   = gather_seq_scatter_heads(key_states,   seq_dim=0, head_dim=1, group=ulysses_group)
+            value_states = gather_seq_scatter_heads(value_states, seq_dim=0, head_dim=1, group=ulysses_group)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
@@ -1065,6 +1094,13 @@ class Qwen3_5VisionAttention(nn.Module):
                 for q, k, v in zip(*splits)
             ]
             attn_output = torch.cat(attn_outputs, dim=1)
+
+        # ── Ulysses SP all-to-all on attention output ──
+        # attn_output shape: (1, S_full_padded, num_heads/sp, head_dim) → squeeze
+        # then scatter seq / gather heads back to (S/sp, num_heads, head_dim).
+        if ulysses_enabled:
+            attn_output = attn_output.squeeze(0)
+            attn_output = gather_heads_scatter_seq(attn_output, head_dim=1, seq_dim=0, group=ulysses_group)
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
@@ -1787,7 +1823,6 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             # Modification: Slice tensor to drop any padded video tokens
             video_embeds = video_embeds[:n_video_tokens]
-            deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
             n_video_features = video_embeds.shape[0]
             if n_video_tokens != n_video_features:
                 raise ValueError(
