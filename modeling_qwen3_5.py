@@ -1752,7 +1752,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         if self.training and get_parallel_state().sp_enabled:
             # (batch_size, seq_len // sp_size, hidden_size) to  (batch_size, seq_len, hidden_size // sp_size)
             inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group
+                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
 
         if pixel_values is not None:
@@ -1763,7 +1763,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             if self.training and get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 image_embeds = gather_seq_scatter_heads(
-                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().ulysses_group
+                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
                 )
             # Original: We calcuated the special_image_mask in the forward pass,
             # but now we pre-compute it and pass it in as image_mask to avoid
@@ -1802,7 +1802,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             if self.training and get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 video_embeds = gather_seq_scatter_heads(
-                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().ulysses_group
+                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
                 )
             
             # Modification: Get the num of video tokens from the pre-computed video_mask
@@ -1851,11 +1851,6 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         
         # Modification: Restore flash attention kwargs for language model to avoid CPU-GPU sync
         kwargs.update(flash_attn_kwargs)
-
-        if self.training and get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
-            )
 
         outputs = self.language_model(
             input_ids=None,
