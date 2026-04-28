@@ -37,9 +37,10 @@ CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 NUM_SAMPLES=350
 SPLIT="false"
 MODEL_TYPE="qwen3_5"
-MAX_CONCURRENCY=32
+MAX_CONCURRENCY=256
 ENABLE_THINKING="true"
 TP_SIZE=1
+DP_SIZE=8
 
 echo "Starting training..."
 
@@ -67,6 +68,7 @@ python api_test.py \
     --max_concurrency "$MAX_CONCURRENCY" \
     --enable_thinking "$ENABLE_THINKING" \
     --tensor_parallel_size "$TP_SIZE" \
+    --data_parallel_size "$DP_SIZE" \
     --num_samples "$NUM_SAMPLES" 2>&1 | tee results_qwen3_5_27b_v2_test2.txt
 "
 
