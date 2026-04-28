@@ -770,17 +770,13 @@ class Qwen3_5Attention(nn.Module):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))  # (B, S/sp, num_kv_heads, D)
         value_states = self.v_proj(hidden_states).view(hidden_shape)             # (B, S/sp, num_kv_heads, D)
 
-        # ── Ulysses SP all-to-all ──
-        # Repeat KV heads to match Q heads BEFORE the all-to-all so that the head
-        # dimension is divisible by sp_size when num_kv_heads < sp_size. After this
-        # the kv heads count equals num_attention_heads, so the attention kernel does
-        # not need to repeat again (pass num_key_value_groups=1).
+        # ── Ulysses SP all-to-all on Q/K/V ──
+        # (B, S/sp, num_heads, D) -> (B, S_full, num_heads/sp, D); GQA ratio preserved
+        # because Q and KV are scattered along the head dim symmetrically. Requires
+        # num_kv_heads % sp_size == 0.
         ulysses_enabled = get_parallel_state().ulysses_enabled
         if ulysses_enabled:
             ulysses_group = get_parallel_state().ulysses_group
-            if self.num_key_value_groups > 1:
-                key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=2)
-                value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=2)
             query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2, group=ulysses_group)
             key_states   = gather_seq_scatter_heads(key_states,   seq_dim=1, head_dim=2, group=ulysses_group)
             value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2, group=ulysses_group)
@@ -801,24 +797,16 @@ class Qwen3_5Attention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        # KV was already replicated to match Q for the SP path; tell the attention
-        # kernel not to repeat again by temporarily setting num_key_value_groups=1.
-        original_groups = self.num_key_value_groups
-        if ulysses_enabled:
-            self.num_key_value_groups = 1
-        try:
-            attn_output, attn_weights = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                **kwargs,
-            )
-        finally:
-            self.num_key_value_groups = original_groups
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
 
         if ulysses_enabled:
             attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, group=ulysses_group)
