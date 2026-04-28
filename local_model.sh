@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=pathology
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=8
 #SBATCH --mem=1024G
 #SBATCH --time=192:00:00
 #SBATCH --gpus-per-node=8
-#SBATCH --cpus-per-task=128
+#SBATCH --cpus-per-task=16
 #SBATCH --output=/work/projects/polyullm/houzht/logs/pathology/local_model_%j_%t_%N.out
 #SBATCH --error=/work/projects/polyullm/houzht/logs/pathology/local_model_%j_%t_%N.err
 #SBATCH --exclude=kb3-a1-nv-dgx01,kb3-a1-nv-dgx02,kb3-a1-nv-dgx03,kb3-a1-nv-dgx04,kb3-a1-nv-dgx05,kb3-a1-nv-dgx06,kb3-a1-nv-dgx07,kb3-a1-nv-dgx16
@@ -33,16 +33,16 @@ OUTPUT_PATH=/work/projects/polyullm/houzht/PrePath/api_test/new_results/results_
 DNN_RESULTS=/work/projects/polyullm/houzht/PrePath/api_test/new_results/threshold0_5_results_test2.csv  # /work/projects/polyullm/houzht/PrePath/api_test/threshold0.5_results_dnn2.csv # /work/projects/polyullm/houzht/PrePath/api_test/1202_threshold0.5_results.csv
 USE_ASYNC="true"
 USE_FEWSHOT="false"
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 NUM_SAMPLES=350
 SPLIT="false"
 MODEL_TYPE="qwen3_5"
-MAX_CONCURRENCY=256
+MAX_CONCURRENCY=32
 ENABLE_THINKING="true"
 TP_SIZE=1
-DP_SIZE=8
 
 echo "Starting training..."
+
+OUTPUT_BASE="${OUTPUT_PATH%.jsonl}"
 
 SCRIPTS="
 
@@ -55,21 +55,25 @@ cd /work/projects/polyullm/houzht/PrePath/api_test
 export SGLANG_ENABLE_JIT_DEEPGEMM=0
 export SGLANG_DISABLE_TRITON=1
 
+# stagger startup to spread weight-loading IO across Lustre
+sleep \$((SLURM_LOCALID * 10))
+
 python api_test.py \
-    --model_path "$MODEL_PATH" \
-    --data_path "$DATA_PATH" \
-    --output_path "$OUTPUT_PATH" \
-    --use_async "$USE_ASYNC" \
-    --use_fewshot "$USE_FEWSHOT" \
-    --dnn_results "$DNN_RESULTS" \
-    --model_type "$MODEL_TYPE" \
-    --cuda_visible_devices "$CUDA_VISIBLE_DEVICES" \
-    --split "$SPLIT" \
-    --max_concurrency "$MAX_CONCURRENCY" \
-    --enable_thinking "$ENABLE_THINKING" \
-    --tensor_parallel_size "$TP_SIZE" \
-    --data_parallel_size "$DP_SIZE" \
-    --num_samples "$NUM_SAMPLES" 2>&1 | tee results_qwen3_5_27b_v2_test2.txt
+    --model_path \"$MODEL_PATH\" \
+    --data_path \"$DATA_PATH\" \
+    --output_path \"${OUTPUT_BASE}.shard\${SLURM_PROCID}.jsonl\" \
+    --use_async \"$USE_ASYNC\" \
+    --use_fewshot \"$USE_FEWSHOT\" \
+    --dnn_results \"$DNN_RESULTS\" \
+    --model_type \"$MODEL_TYPE\" \
+    --cuda_visible_devices \"\$SLURM_LOCALID\" \
+    --split \"$SPLIT\" \
+    --max_concurrency \"$MAX_CONCURRENCY\" \
+    --enable_thinking \"$ENABLE_THINKING\" \
+    --tensor_parallel_size \"$TP_SIZE\" \
+    --rank \"\$SLURM_PROCID\" \
+    --world_size \"\$SLURM_NTASKS\" \
+    --num_samples \"$NUM_SAMPLES\" 2>&1 | tee results_qwen3_5_27b_v2_test2.rank\${SLURM_PROCID}.txt
 "
 
 PYTHONUNBUFFERED=1 srun --overlap \

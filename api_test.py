@@ -59,11 +59,12 @@ def get_parser():
     parser.add_argument('--repetition_penalty', type=float, default=1.1)
     parser.add_argument('--cuda_visible_devices', type=str, default="0")
     parser.add_argument('--tensor_parallel_size', type=str, default="8")
-    parser.add_argument('--data_parallel_size', type=str, default="1")
     parser.add_argument('--split', type=str, default="false")
     parser.add_argument('--model_type', type=str, default="qwen3")
     parser.add_argument('--enable_thinking', type=str, default="true")
     parser.add_argument('--max_concurrency', type=int, default=1)
+    parser.add_argument('--rank', type=int, default=0)
+    parser.add_argument('--world_size', type=int, default=1)
 
     return parser
 
@@ -218,6 +219,8 @@ class API_MODEL:
         self.use_fewshot = args.use_fewshot.lower() == "true"
         self.data_path = args.data_path
         self.output_path = args.output_path
+        self.rank = args.rank
+        self.world_size = args.world_size
         self.data = self.read_data()
         self.idx_list = []
 
@@ -257,6 +260,9 @@ class API_MODEL:
 
         if self.num_samples > 0:
             df = df.iloc[:self.num_samples]
+
+        if self.world_size > 1:
+            df = df.iloc[self.rank::self.world_size]
 
         data = []
         for idx, row in df.iterrows():
@@ -467,7 +473,9 @@ class API_MODEL:
 class Qwen3VL:
     def __init__(self, args):
         print("tp size:", int(os.environ.get("TENSOR_PARALLEL_SIZE", 1)))
-        print("dp size:", int(os.environ.get("DATA_PARALLEL_SIZE", 1)))
+        print(f"rank: {args.rank} / world_size: {args.world_size}")
+        self.rank = args.rank
+        self.world_size = args.world_size
         self.tokenizer = AutoTokenizer.from_pretrained(args.model_path)
         self.config = AutoConfig.from_pretrained(args.model_path)
         self.context_length = self.tokenizer.model_max_length
@@ -476,7 +484,6 @@ class Qwen3VL:
             enable_multimodal=True,
             mem_fraction_static=0.6,
             tp_size=int(os.environ.get("TENSOR_PARALLEL_SIZE", 1)),
-            dp_size=int(os.environ.get("DATA_PARALLEL_SIZE", 1)),
             attention_backend="fa3",
             context_length=self.context_length,
             # enable_torch_compile=False,
@@ -538,6 +545,9 @@ class Qwen3VL:
 
         if self.num_samples > 0:
             df = df.iloc[:self.num_samples]
+
+        if self.world_size > 1:
+            df = df.iloc[self.rank::self.world_size]
 
         data = []
         for idx, row in df.iterrows():
@@ -726,7 +736,9 @@ class Qwen3VL:
 class Qwen3_5:
     def __init__(self, args):
         print("tp size:", int(os.environ.get("TENSOR_PARALLEL_SIZE", 1)))
-        print("dp size:", int(os.environ.get("DATA_PARALLEL_SIZE", 1)))
+        print(f"rank: {args.rank} / world_size: {args.world_size}")
+        self.rank = args.rank
+        self.world_size = args.world_size
         self.tokenizer = AutoTokenizer.from_pretrained(args.model_path)
         self.config = AutoConfig.from_pretrained(args.model_path)
         self.context_length = self.tokenizer.model_max_length
@@ -735,7 +747,6 @@ class Qwen3_5:
             enable_multimodal=True,
             mem_fraction_static=0.8,
             tp_size=int(os.environ.get("TENSOR_PARALLEL_SIZE", 1)),
-            dp_size=int(os.environ.get("DATA_PARALLEL_SIZE", 1)),
             attention_backend="fa3",
             context_length=self.context_length,
             # enable_torch_compile=False,
@@ -797,6 +808,9 @@ class Qwen3_5:
 
         if self.num_samples > 0:
             df = df.iloc[:self.num_samples]
+
+        if self.world_size > 1:
+            df = df.iloc[self.rank::self.world_size]
 
         data = []
         for idx, row in df.iterrows():
@@ -1086,8 +1100,7 @@ def main():
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     os.environ["TENSOR_PARALLEL_SIZE"] = args.tensor_parallel_size
-    os.environ["DATA_PARALLEL_SIZE"] = args.data_parallel_size
-    if int(args.tensor_parallel_size) > 1 or int(args.data_parallel_size) > 1:
+    if int(args.tensor_parallel_size) > 1:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     if args.model_path:
