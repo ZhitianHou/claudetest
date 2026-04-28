@@ -768,19 +768,9 @@ class Qwen3_5Attention(nn.Module):
         )
         gate = gate.reshape(*input_shape, -1)
 
-        query_states = self.q_norm(query_states.view(hidden_shape))   # (B, S/sp, num_q_heads, D)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))  # (B, S/sp, num_kv_heads, D)
-        value_states = self.v_proj(hidden_states).view(hidden_shape)             # (B, S/sp, num_kv_heads, D)
-
-        # ── Ulysses SP all-to-all ──
-        if get_parallel_state().ulysses_enabled:
-            query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            key_states   = gather_seq_scatter_heads(key_states,   seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-
-        query_states = query_states.transpose(1, 2)
-        key_states   = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -804,9 +794,6 @@ class Qwen3_5Attention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-
-        if get_parallel_state().ulysses_enabled:
-            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
@@ -1728,7 +1715,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         if self.training and get_parallel_state().sp_enabled:
             # (batch_size, seq_len // sp_size, hidden_size) to  (batch_size, seq_len, hidden_size // sp_size)
             inputs_embeds = gather_seq_scatter_heads(
-                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group
+                inputs_embeds, seq_dim=1, head_dim=2, group=get_parallel_state().sp_group
             )
 
         if pixel_values is not None:
@@ -1739,7 +1726,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             if self.training and get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 image_embeds = gather_seq_scatter_heads(
-                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().ulysses_group
+                    image_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
                 )
             # Original: We calcuated the special_image_mask in the forward pass,
             # but now we pre-compute it and pass it in as image_mask to avoid
@@ -1778,7 +1765,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             if self.training and get_parallel_state().sp_enabled:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 video_embeds = gather_seq_scatter_heads(
-                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().ulysses_group
+                    video_embeds, seq_dim=0, head_dim=-1, group=get_parallel_state().sp_group
                 )
             
             # Modification: Get the num of video tokens from the pre-computed video_mask
@@ -1828,11 +1815,6 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         
         # Modification: Restore flash attention kwargs for language model to avoid CPU-GPU sync
         kwargs.update(flash_attn_kwargs)
-
-        if self.training and get_parallel_state().sp_enabled:
-            inputs_embeds = gather_heads_scatter_seq(
-                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
-            )
 
         outputs = self.language_model(
             input_ids=None,
