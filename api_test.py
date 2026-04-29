@@ -65,6 +65,7 @@ def get_parser():
     parser.add_argument('--max_concurrency', type=int, default=1)
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--world_size', type=int, default=1)
+    parser.add_argument('--eval_only', type=str, default="false")
 
     return parser
 
@@ -1097,6 +1098,12 @@ def evaluation(results):
 
 def main():
     args = get_parser().parse_args()
+
+    if args.eval_only.lower() == "true":
+        results = list(API_MODEL.read_jsonl(args.output_path).values())
+        print(f"[eval_only] Loaded {len(results)} results from {args.output_path}")
+        evaluation(results)
+        return
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     os.environ["TENSOR_PARALLEL_SIZE"] = args.tensor_parallel_size
