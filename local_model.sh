@@ -85,3 +85,30 @@ PYTHONUNBUFFERED=1 srun --overlap \
     --container-remap-root \
     bash -c "$SCRIPTS"
 
+echo "All ranks finished. Merging shards into $OUTPUT_PATH ..."
+cat ${OUTPUT_BASE}.shard*.jsonl > "$OUTPUT_PATH"
+echo "Merged $(wc -l < $OUTPUT_PATH) lines."
+
+EVAL_SCRIPTS="
+
+eval \"\$(/work/projects/polyullm/houzht/miniconda3/bin/conda shell.bash hook)\"
+
+conda activate $CONDA_ENV_DIR
+
+cd /work/projects/polyullm/houzht/PrePath/api_test
+
+python api_test.py \
+    --eval_only true \
+    --output_path \"$OUTPUT_PATH\" \
+    --model_type \"$MODEL_TYPE\" 2>&1 | tee results_qwen3_5_27b_v2_test2.eval.txt
+"
+
+PYTHONUNBUFFERED=1 srun --overlap --ntasks=1 \
+    --container-name=$container_name \
+    --container-mounts=$container_mounts \
+    --container-image=$container_image \
+    --container-workdir=$workdir \
+    --container-writable \
+    --container-remap-root \
+    bash -c "$EVAL_SCRIPTS"
+
