@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Any, Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -47,6 +48,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwe
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
+    gather_outputs,
     gather_seq_scatter_heads,
     sp_pad_and_slice,
 )
@@ -68,6 +70,27 @@ else:
     FusedRMSNormGated = None
 
 logger = logging.get_logger(__name__)
+
+
+class _SliceSeqWithFullGrad(torch.autograd.Function):
+    """Slice along `dim` for this rank; backward all-gathers grads and concatenates so the upstream op sees the full-sequence gradient. Local replacement for `slice_input_tensor_scale_grad`, whose `_Slice.backward` mishandles `_all_gather`'s tuple return."""
+
+    @staticmethod
+    def forward(ctx, x, dim, group):
+        ctx.dim = dim
+        ctx.group = group
+        ctx.world_size = dist.get_world_size(group)
+        ctx.rank = dist.get_rank(group)
+        chunk = x.size(dim) // ctx.world_size
+        return x.narrow(dim, ctx.rank * chunk, chunk).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_output = grad_output.contiguous()
+        gather_list = [torch.empty_like(grad_output) for _ in range(ctx.world_size)]
+        dist.all_gather(gather_list, grad_output, group=ctx.group)
+        return torch.cat(gather_list, dim=ctx.dim).contiguous(), None, None
+
 
 # Modification: wrapped Qwen3VLModel.get_rope_index to use in process_sample for obtaining position_ids in advance
 def get_position_id(main_func, self, **kwargs):
@@ -766,17 +789,18 @@ class Qwen3_5Attention(nn.Module):
         )
         gate = gate.reshape(*input_shape, -1)
 
-        query_states = self.q_norm(query_states.view(hidden_shape))   # (B, S/sp, num_q_heads, D)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))  # (B, S/sp, num_kv_heads, D)
-        value_states = self.v_proj(hidden_states).view(hidden_shape)             # (B, S/sp, num_kv_heads, D)
+        query_states = self.q_norm(query_states.view(hidden_shape))
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
+        value_states = self.v_proj(hidden_states).view(hidden_shape)
 
-        # ── Ulysses SP all-to-all on Q/K/V ──
-        # (B, S/sp, num_heads, D) -> (B, S_full, num_heads/sp, D); GQA ratio preserved
-        # because Q and KV are scattered along the head dim symmetrically. Requires
-        # num_kv_heads % sp_size == 0.
+        # Ulysses SP: expand KV to num_q_heads BEFORE all-to-all so each rank ends up with
+        # matching q/kv head counts after a2a. Without this, num_kv_heads/sp may be < num_q_heads/sp
+        # and FA2 produces NaN on the GQA path under Ulysses.
         ulysses_enabled = get_parallel_state().ulysses_enabled
         if ulysses_enabled:
             ulysses_group = get_parallel_state().ulysses_group
+            key_states   = repeat_kv(key_states.transpose(1, 2),   self.num_key_value_groups).transpose(1, 2)
+            value_states = repeat_kv(value_states.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
             query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2, group=ulysses_group)
             key_states   = gather_seq_scatter_heads(key_states,   seq_dim=1, head_dim=2, group=ulysses_group)
             value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2, group=ulysses_group)
@@ -789,7 +813,6 @@ class Qwen3_5Attention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
@@ -881,14 +904,23 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Token Mixer
         if self.layer_type == "linear_attention":
+            # linear_attn is a causal-time recurrence; it needs the full sequence on every rank.
+            # Under SP, gather seq before, slice back after.
+            ulysses_active = self.training and get_parallel_state().ulysses_enabled
+            ulysses_group = get_parallel_state().ulysses_group if ulysses_active else None
+            if ulysses_active:
+                hidden_states = gather_outputs(hidden_states, gather_dim=1, scale_grad=False, group=ulysses_group)
+
             hidden_states = self.linear_attn(
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
             )
+
+            if ulysses_active:
+                hidden_states = _SliceSeqWithFullGrad.apply(hidden_states, 1, ulysses_group)
         elif self.layer_type == "full_attention":
             # Self Attention
             hidden_states, _ = self.self_attn(
@@ -1826,7 +1858,12 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             fake_embeds = fake_embeds.mean() * 0.0
             fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds + fake_embeds
-            
+
+        if self.training and get_parallel_state().sp_enabled:
+            # (batch_size, seq_len, hidden_size // sp_size) to (batch_size, seq_len // sp_size, hidden_size)
+            inputs_embeds = gather_heads_scatter_seq(
+                inputs_embeds, head_dim=2, seq_dim=1, group=get_parallel_state().sp_group
+            )
 
         if position_ids is None:
             past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
