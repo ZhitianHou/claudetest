@@ -476,6 +476,34 @@ def torch_recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+class _AllGatherSeqDuplicated(torch.autograd.Function):
+    """All-gather along ``seq_dim`` whose backward returns the local rank's
+    gradient slice (no reduce-scatter).
+
+    Use this instead of ``dist.nn.all_gather`` when the post-gather computation
+    is *duplicated* across SP ranks (each rank sees the full sequence and runs
+    the same kernel, e.g. linear / chunk-recurrent attention). The default
+    all-gather backward performs a reduce-scatter, which would sum ``sp_size``
+    identical copies of the gradient and inflate it by ``sp_size``. Equivalent
+    to slime's ``_AllGatherForDuplicatedComputation`` (THUDM/slime PR #1748).
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, group, seq_dim: int) -> torch.Tensor:
+        ctx.group = group
+        ctx.world_size = dist.get_world_size(group=group)
+        ctx.rank = dist.get_rank(group=group)
+        ctx.seq_dim = seq_dim
+        gathered = [torch.empty_like(x) for _ in range(ctx.world_size)]
+        dist.all_gather(gathered, x.contiguous(), group=group)
+        return torch.cat(gathered, dim=seq_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        chunks = grad_output.chunk(ctx.world_size, dim=ctx.seq_dim)
+        return chunks[ctx.rank].contiguous(), None, None
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
         super().__init__()
@@ -549,6 +577,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
+        # ── Ulysses SP: linear attention's chunk recurrence is non-decomposable
+        # along the seq dim, so we gather the full sequence and run the kernel
+        # identically on every SP rank. The custom autograd makes the backward
+        # return only the local slice (no reduce-scatter), avoiding gradient
+        # inflation by sp_size. See slime PR #1748.
+        sp_enabled = get_parallel_state().sp_enabled and self.training
+        if sp_enabled:
+            sp_group = get_parallel_state().sp_group
+            sp_size = get_parallel_state().sp_size
+            sp_rank = dist.get_rank(group=sp_group)
+            hidden_states = _AllGatherSeqDuplicated.apply(hidden_states, sp_group, 1)
+            if attention_mask is not None and attention_mask.shape[1] != hidden_states.shape[1]:
+                # gather attention_mask along seq if it's still SP-sliced
+                attention_mask = _AllGatherSeqDuplicated.apply(attention_mask, sp_group, 1)
+
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         # Set up dimensions for reshapes later
@@ -657,6 +700,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         output = self.out_proj(core_attn_out)
+
+        if sp_enabled:
+            # Slice the (duplicated) full output back to the local SP shard.
+            # Backward of indexing places local d at the rank's slice, so each
+            # rank's d_full_output is zero outside its slice — the linear-attn
+            # backward then propagates a unique d_full_input per rank, and
+            # _AllGatherSeqDuplicated.backward picks the local slice (no reduce).
+            output = output.chunk(sp_size, dim=1)[sp_rank].contiguous()
+
         return output
 
 
