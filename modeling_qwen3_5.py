@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -55,6 +56,19 @@ from ....distributed.sequence_parallel import (
 from ....ops.loss import causallm_loss_function
 from ....utils import helper
 from ....utils.device import is_torch_npu_available
+
+
+# FA 2.8.3 API: flash_attn_varlen_func is the varlen entry point. Importing directly
+# from flash_attn lets us bypass HF's attention_interface wrapper, which is
+# incompatible with Ulysses SP a2a + GQA + packed-seq cu_seqlens. The qwen2_5_vl
+# model (modeling_qwen2_5_vl.py:1032) already does this; qwen3_5 was missing it.
+try:
+    from flash_attn import flash_attn_varlen_func, flash_attn_func
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    flash_attn_varlen_func = None
+    flash_attn_func = None
+    _HAS_FLASH_ATTN = False
 
 
 if is_causal_conv1d_available():
@@ -476,34 +490,6 @@ def torch_recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
-class _AllGatherSeqDuplicated(torch.autograd.Function):
-    """All-gather along ``seq_dim`` whose backward returns the local rank's
-    gradient slice (no reduce-scatter).
-
-    Use this instead of ``dist.nn.all_gather`` when the post-gather computation
-    is *duplicated* across SP ranks (each rank sees the full sequence and runs
-    the same kernel, e.g. linear / chunk-recurrent attention). The default
-    all-gather backward performs a reduce-scatter, which would sum ``sp_size``
-    identical copies of the gradient and inflate it by ``sp_size``. Equivalent
-    to slime's ``_AllGatherForDuplicatedComputation`` (THUDM/slime PR #1748).
-    """
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, group, seq_dim: int) -> torch.Tensor:
-        ctx.group = group
-        ctx.world_size = dist.get_world_size(group=group)
-        ctx.rank = dist.get_rank(group=group)
-        ctx.seq_dim = seq_dim
-        gathered = [torch.empty_like(x) for _ in range(ctx.world_size)]
-        dist.all_gather(gathered, x.contiguous(), group=group)
-        return torch.cat(gathered, dim=seq_dim)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        chunks = grad_output.chunk(ctx.world_size, dim=ctx.seq_dim)
-        return chunks[ctx.rank].contiguous(), None, None
-
-
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
         super().__init__()
@@ -577,21 +563,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
-        # ── Ulysses SP: linear attention's chunk recurrence is non-decomposable
-        # along the seq dim, so we gather the full sequence and run the kernel
-        # identically on every SP rank. The custom autograd makes the backward
-        # return only the local slice (no reduce-scatter), avoiding gradient
-        # inflation by sp_size. See slime PR #1748.
-        sp_enabled = get_parallel_state().sp_enabled and self.training
-        if sp_enabled:
-            sp_group = get_parallel_state().sp_group
-            sp_size = get_parallel_state().sp_size
-            sp_rank = dist.get_rank(group=sp_group)
-            hidden_states = _AllGatherSeqDuplicated.apply(hidden_states, sp_group, 1)
-            if attention_mask is not None and attention_mask.shape[1] != hidden_states.shape[1]:
-                # gather attention_mask along seq if it's still SP-sliced
-                attention_mask = _AllGatherSeqDuplicated.apply(attention_mask, sp_group, 1)
-
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         # Set up dimensions for reshapes later
@@ -700,15 +671,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         output = self.out_proj(core_attn_out)
-
-        if sp_enabled:
-            # Slice the (duplicated) full output back to the local SP shard.
-            # Backward of indexing places local d at the rank's slice, so each
-            # rank's d_full_output is zero outside its slice — the linear-attn
-            # backward then propagates a unique d_full_input per rank, and
-            # _AllGatherSeqDuplicated.backward picks the local slice (no reduce).
-            output = output.chunk(sp_size, dim=1)[sp_rank].contiguous()
-
         return output
 
 
@@ -857,6 +819,7 @@ class Qwen3_5Attention(nn.Module):
             key_states   = gather_seq_scatter_heads(key_states,   seq_dim=1, head_dim=2, group=ulysses_group)
             value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2, group=ulysses_group)
 
+        # (B, H, S, D) for RoPE
         query_states = query_states.transpose(1, 2)
         key_states   = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
@@ -868,20 +831,38 @@ class Qwen3_5Attention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+        # Under Ulysses SP we cannot use HF's attention_interface: after a2a, q has
+        # num_q/sp heads but module.num_attention_heads still says num_q, which
+        # confuses HF's FA2 wrapper (head-count vs module-attr mismatch). Use our
+        # own FA2 path with cu_seqlens computed from position_ids — same approach
+        # as Qwen2_5_VLFlashAttention2 in modeling_qwen2_5_vl.py:1032.
+        if ulysses_enabled and _HAS_FLASH_ATTN:
+            # (B, H, S, D) -> (B, S, H, D) for flash_attn
+            q_fa = query_states.transpose(1, 2).contiguous()
+            k_fa = key_states.transpose(1, 2).contiguous()
+            v_fa = value_states.transpose(1, 2).contiguous()
+            position_ids = kwargs.get("position_ids", None)
+            attn_output = self.flash_attention_forward(
+                q_fa, k_fa, v_fa,
+                position_ids=position_ids,
+                dropout_p=0.0 if not self.training else self.attention_dropout,
+                is_causal=self.is_causal,
+            )
+            attn_weights = None
+        else:
+            attention_interface: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
 
         if ulysses_enabled:
             attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, group=ulysses_group)
@@ -891,6 +872,80 @@ class Qwen3_5Attention(nn.Module):
 
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+    def _prepare_fa2_from_position_ids(self, query, key, value, position_ids):
+        """Construct cu_seqlens and max_length from position_ids resets for packed seqs.
+        Inputs: q/k/v of shape (B, S, H, D); position_ids of shape (B, S).
+        Output q/k/v are flattened to (B*S, H, D) — flash_attn_varlen_func format.
+        Position_ids zeros mark the start of each packed document.
+        Adapted from Qwen2_5_VLFlashAttention2._prepare_fa2_from_position_ids.
+        """
+        query = query.view(-1, query.size(-2), query.size(-1))
+        key = key.view(-1, key.size(-2), key.size(-1))
+        value = value.view(-1, value.size(-2), value.size(-1))
+        position_ids = position_ids.flatten()
+        indices_q = torch.arange(position_ids.size(0), device=position_ids.device, dtype=torch.int32)
+        cu_seqlens = torch.cat(
+            (
+                indices_q[position_ids == 0],
+                torch.tensor(position_ids.size(), device=position_ids.device, dtype=torch.int32),
+            )
+        )
+        max_length = cu_seqlens.diff().max()
+        return query, key, value, cu_seqlens, max_length
+
+    def flash_attention_forward(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        dropout_p: float,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        """Custom FA2 path for SP+packed sequences. Inputs (B, S, H, D). Output same shape.
+        FA 2.8.3 API: flash_attn_varlen_func supports `deterministic` (>= 2.4.1).
+        Honors FLASH_ATTENTION_DETERMINISTIC env var like qwen2_5_vl does.
+        """
+        deterministic = os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
+
+        # Detect packed sequences (rmpad_with_pos_ids): position_ids has resets to 0,
+        # so torch.diff has negative values somewhere. Use varlen path with explicit
+        # cu_seqlens. Otherwise fall back to standard FA (single seq per batch row).
+        use_varlen = (
+            position_ids is not None
+            and query_states.size(1) > 1
+            and not (torch.diff(position_ids[0], dim=-1) >= 0).all()
+        )
+
+        if use_varlen:
+            batch_size = query_states.size(0)
+            q, k, v, cu_seqlens, max_length = self._prepare_fa2_from_position_ids(
+                query_states, key_states, value_states, position_ids[0]
+            )
+            attn_output = flash_attn_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_length,
+                max_seqlen_k=max_length,
+                dropout_p=dropout_p,
+                softmax_scale=self.scaling,
+                causal=is_causal,
+                deterministic=deterministic,
+            )
+            attn_output = attn_output.view(batch_size, -1, attn_output.size(-2), attn_output.size(-1))
+        else:
+            attn_output = flash_attn_func(
+                query_states,
+                key_states,
+                value_states,
+                dropout_p=dropout_p,
+                softmax_scale=self.scaling,
+                causal=is_causal,
+                deterministic=deterministic,
+            )
+        return attn_output
 
 
 class Qwen3_5MLP(nn.Module):
@@ -1128,7 +1183,12 @@ class Qwen3_5VisionAttention(nn.Module):
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         if self.config._attn_implementation == "flash_attention_2":
-            # Flash Attention: Use cu_seqlens for variable length attention
+            # Flash Attention: Use cu_seqlens for variable length attention.
+            # skip_ulysses=True: this vision attention already did its own a2a
+            # at lines 1170-1175 (pre) and 1228-1230 (post). Without this flag,
+            # veomni/ops/attention.py:flash_attention_forward would do a SECOND
+            # a2a and trip the `q_head_num % ulysses_size == 0` assertion when
+            # H_vis/sp is no longer divisible by sp (e.g. H_vis=16, sp=8 → 2).
             attn_output, _ = attention_interface(
                 self,
                 query_states,
@@ -1142,6 +1202,7 @@ class Qwen3_5VisionAttention(nn.Module):
                 max_length_q=max_seqlen,
                 max_length_k=max_seqlen,
                 is_causal=False,
+                skip_ulysses=True,
                 **kwargs,
             )
         else:
@@ -1973,6 +2034,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         self.model = Qwen3_5TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.loss_function = causallm_loss_function
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -2028,11 +2090,11 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        hidden_states = hidden_states[:, slice_indices, :]
 
         loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+        logits = None
+        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
 
         return CausalLMOutputWithPast(
             loss=loss,
